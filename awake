@@ -1,6 +1,6 @@
 #!/bin/bash
 # awake — manual + scheduled control of macOS anti-sleep / anti-screensaver
-# https://github.com/aleksei-chirkunov/macos_awake
+# https://github.com/alexzerg/macos_awake
 #
 # Two LaunchAgents:
 #   ${NS}.nosleep   — runs `caffeinate -disu`
