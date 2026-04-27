@@ -1,0 +1,6 @@
+.DS_Store
+.awake/
+*.log
+*.swp
+.idea/
+.vscode/

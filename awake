@@ -1,0 +1,231 @@
+#!/bin/bash
+# awake — manual + scheduled control of macOS anti-sleep / anti-screensaver
+# https://github.com/aleksei-chirkunov/macos_awake
+#
+# Two LaunchAgents:
+#   ${NS}.nosleep   — runs `caffeinate -disu`
+#   ${NS}.hidnudge  — runs hid-nudge.sh (resets HID idle for MDM screensavers)
+#
+# Optional weekend schedule:
+#   ${NS}.friday    — Fri 23:59 → awake disable
+#   ${NS}.monday    — Mon 07:00 → awake enable && awake on
+#
+# Override namespace: export AWAKE_NS=com.yourname
+# Override hid-nudge:  export AWAKE_HID=/path/to/hid-nudge.sh
+
+set -u
+
+NS="${AWAKE_NS:-com.awake}"
+UID_NUM=$(id -u)
+DOMAIN="gui/$UID_NUM"
+AGENTS_DIR="$HOME/Library/LaunchAgents"
+LOG_DIR="$HOME/.awake"
+mkdir -p "$LOG_DIR"
+SCHED_LOG="$LOG_DIR/scheduled.log"
+
+NOSLEEP_LABEL="$NS.nosleep"
+HIDNUDGE_LABEL="$NS.hidnudge"
+FRIDAY_LABEL="$NS.friday"
+MONDAY_LABEL="$NS.monday"
+
+NOSLEEP_PLIST="$AGENTS_DIR/$NOSLEEP_LABEL.plist"
+HIDNUDGE_PLIST="$AGENTS_DIR/$HIDNUDGE_LABEL.plist"
+FRIDAY_PLIST="$AGENTS_DIR/$FRIDAY_LABEL.plist"
+MONDAY_PLIST="$AGENTS_DIR/$MONDAY_LABEL.plist"
+
+# Resolve awake binary path (works from symlink too)
+AWAKE_BIN="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+# hid-nudge: prefer env override, then same dir as awake, then ~/bin
+if [ -n "${AWAKE_HID:-}" ] && [ -x "$AWAKE_HID" ]; then
+  HID_SCRIPT="$AWAKE_HID"
+elif [ -x "$(dirname "$AWAKE_BIN")/hid-nudge.sh" ]; then
+  HID_SCRIPT="$(dirname "$AWAKE_BIN")/hid-nudge.sh"
+elif [ -x "$HOME/bin/hid-nudge.sh" ]; then
+  HID_SCRIPT="$HOME/bin/hid-nudge.sh"
+else
+  HID_SCRIPT=""
+fi
+
+# ── helpers ──
+is_loaded()   { launchctl print "$DOMAIN/$1" >/dev/null 2>&1; }
+is_disabled() { launchctl print-disabled "$DOMAIN" 2>/dev/null | grep -q "\"$1\" => disabled"; }
+get_pid()     { launchctl print "$DOMAIN/$1" 2>/dev/null | awk '/^\tpid =/ {print $3; exit}'; }
+
+load_one() {
+  local plist="$1" label="$2"
+  [ -f "$plist" ] || { echo "⚠️  $label: plist not found (run: awake install)"; return 1; }
+  if is_loaded "$label"; then echo "ℹ️  $label: already loaded"
+  else launchctl bootstrap "$DOMAIN" "$plist" 2>/dev/null && echo "✅ $label: loaded" \
+    || echo "❌ $label: bootstrap failed (try: awake enable)"; fi
+}
+
+unload_one() {
+  local label="$1"
+  if is_loaded "$label"; then
+    launchctl bootout "$DOMAIN/$label" 2>/dev/null && echo "✅ $label: unloaded" \
+      || echo "❌ $label: bootout failed"
+  else echo "ℹ️  $label: not loaded"; fi
+}
+
+enable_one()  { launchctl enable  "$DOMAIN/$1" 2>/dev/null; echo "✅ $1: enabled"; }
+disable_one() { launchctl disable "$DOMAIN/$1" 2>/dev/null; echo "✅ $1: disabled"; }
+
+# ── plist writers ──
+write_main_plists() {
+  cat > "$NOSLEEP_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$NOSLEEP_LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>/usr/bin/caffeinate</string><string>-disu</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$LOG_DIR/nosleep.log</string>
+  <key>StandardErrorPath</key><string>$LOG_DIR/nosleep.log</string>
+</dict></plist>
+PLIST
+  echo "✅ wrote $NOSLEEP_PLIST"
+
+  if [ -n "$HID_SCRIPT" ]; then
+    cat > "$HIDNUDGE_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$HIDNUDGE_LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>$HID_SCRIPT</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$LOG_DIR/hidnudge.log</string>
+  <key>StandardErrorPath</key><string>$LOG_DIR/hidnudge.log</string>
+</dict></plist>
+PLIST
+    echo "✅ wrote $HIDNUDGE_PLIST"
+  else
+    echo "ℹ️  skipped hidnudge plist (no hid-nudge.sh found)"
+  fi
+}
+
+write_schedule_plist() {
+  local plist="$1" label="$2" weekday="$3" hour="$4" minute="$5" cmd="$6"
+  cat > "$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>-l</string><string>-c</string><string>$cmd</string></array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key><integer>$weekday</integer>
+    <key>Hour</key><integer>$hour</integer>
+    <key>Minute</key><integer>$minute</integer>
+  </dict>
+  <key>StandardOutPath</key><string>$SCHED_LOG</string>
+  <key>StandardErrorPath</key><string>$SCHED_LOG</string>
+</dict></plist>
+PLIST
+}
+
+# ── commands ──
+cmd_install() {
+  echo "── installing (namespace: $NS) ──"
+  write_main_plists
+  echo
+  echo "Run 'awake on' to start, or 'awake schedule' to add weekend auto-toggle."
+  echo; cmd_status
+}
+
+cmd_uninstall() {
+  echo "── uninstalling ──"
+  cmd_off
+  cmd_unschedule
+  rm -f "$NOSLEEP_PLIST" "$HIDNUDGE_PLIST"
+  echo "✅ removed main plists"
+  echo "ℹ️  logs preserved at $LOG_DIR — remove manually if desired"
+}
+
+cmd_on()  { load_one "$NOSLEEP_PLIST" "$NOSLEEP_LABEL"; [ -f "$HIDNUDGE_PLIST" ] && load_one "$HIDNUDGE_PLIST" "$HIDNUDGE_LABEL" || true; echo; cmd_status; }
+cmd_off() { unload_one "$NOSLEEP_LABEL"; unload_one "$HIDNUDGE_LABEL"; echo; cmd_status; }
+cmd_enable()  { enable_one "$NOSLEEP_LABEL"; [ -f "$HIDNUDGE_PLIST" ] && enable_one "$HIDNUDGE_LABEL" || true; }
+cmd_disable() { unload_one "$NOSLEEP_LABEL"; unload_one "$HIDNUDGE_LABEL"; disable_one "$NOSLEEP_LABEL"; disable_one "$HIDNUDGE_LABEL"; }
+
+cmd_schedule() {
+  local fri_h="${1:-23}" fri_m="${2:-59}" mon_h="${3:-7}" mon_m="${4:-0}"
+  echo "── installing schedule ──"
+  echo "  Friday $fri_h:$(printf %02d $fri_m) → awake disable"
+  echo "  Monday $mon_h:$(printf %02d $mon_m) → awake enable && awake on"
+  echo
+  write_schedule_plist "$FRIDAY_PLIST" "$FRIDAY_LABEL" 5 "$fri_h" "$fri_m" \
+    "echo \"[\$(date)] friday: awake disable\" >> $SCHED_LOG; $AWAKE_BIN disable"
+  write_schedule_plist "$MONDAY_PLIST" "$MONDAY_LABEL" 1 "$mon_h" "$mon_m" \
+    "echo \"[\$(date)] monday: awake enable + on\" >> $SCHED_LOG; $AWAKE_BIN enable && $AWAKE_BIN on"
+  is_loaded "$FRIDAY_LABEL" && launchctl bootout "$DOMAIN/$FRIDAY_LABEL" 2>/dev/null || true
+  is_loaded "$MONDAY_LABEL" && launchctl bootout "$DOMAIN/$MONDAY_LABEL" 2>/dev/null || true
+  launchctl enable "$DOMAIN/$FRIDAY_LABEL" 2>/dev/null || true
+  launchctl enable "$DOMAIN/$MONDAY_LABEL" 2>/dev/null || true
+  load_one "$FRIDAY_PLIST" "$FRIDAY_LABEL"
+  load_one "$MONDAY_PLIST" "$MONDAY_LABEL"
+  echo; cmd_status
+}
+
+cmd_unschedule() {
+  echo "── removing schedule ──"
+  unload_one "$FRIDAY_LABEL"
+  unload_one "$MONDAY_LABEL"
+  rm -f "$FRIDAY_PLIST" "$MONDAY_PLIST"
+  echo "✅ schedule plists deleted"
+}
+
+cmd_status() {
+  echo "── awake status (namespace: $NS) ──"
+  for label in "$NOSLEEP_LABEL" "$HIDNUDGE_LABEL"; do
+    local state pid disabled
+    if is_loaded "$label"; then
+      pid=$(get_pid "$label")
+      [ -n "$pid" ] && [ "$pid" != "-" ] && [ "$pid" != "0" ] \
+        && state="✅ RUNNING (PID $pid)" || state="⚠️  loaded but no PID"
+    else state="❌ not loaded"; fi
+    if is_disabled "$label"; then disabled="  [🚫 disabled at login]"
+    else disabled="  [✅ enabled at login]"; fi
+    printf "  %-30s %s%s\n" "$label" "$state" "$disabled"
+  done
+  echo
+  echo "── schedule ──"
+  for label in "$FRIDAY_LABEL" "$MONDAY_LABEL"; do
+    if is_loaded "$label"; then printf "  %-30s ✅ active\n" "$label"
+    elif [ -f "$AGENTS_DIR/$label.plist" ]; then printf "  %-30s ⚠️  plist exists, not loaded\n" "$label"
+    else printf "  %-30s ❌ not installed\n" "$label"; fi
+  done
+  echo "  log: $SCHED_LOG"
+}
+
+case "${1:-status}" in
+  install)          cmd_install ;;
+  uninstall)        cmd_uninstall ;;
+  on|start)         cmd_on ;;
+  off|stop)         cmd_off ;;
+  enable)           cmd_enable ;;
+  disable)          cmd_disable ;;
+  schedule)         shift; cmd_schedule "$@" ;;
+  unschedule)       cmd_unschedule ;;
+  status|st|"")     cmd_status ;;
+  *) cat <<USAGE
+Usage: awake <command> [args]
+
+  install                    write LaunchAgent plists to ~/Library/LaunchAgents
+  uninstall                  remove all plists (stops + unschedules)
+
+  on / off                   start / stop now
+  enable / disable           permit / block auto-start at login
+
+  schedule [Fh Fm Mh Mm]     auto-toggle: default Fri 23:59 off, Mon 07:00 on
+                             example: awake schedule 18 0 7 30
+  unschedule                 remove auto-toggle
+
+  status                     show what is loaded, running, scheduled
+USAGE
+     exit 1 ;;
+esac
