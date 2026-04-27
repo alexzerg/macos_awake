@@ -21,7 +21,7 @@ Both run as `launchd` LaunchAgents with `KeepAlive=true`, so they survive crashe
 ## Install
 
 ```bash
-git clone https://github.com/aleksei-chirkunov/macos_awake.git
+git clone https://github.com/alexzerg/macos_awake.git
 cd macos_awake
 make install        # copies scripts to ~/bin, writes LaunchAgent plists
 awake on            # start right now
@@ -93,7 +93,7 @@ echo 'export AWAKE_NS=com.yourdomain.awake' >> ~/.zshrc
 
 ```bash
 # Different namespace (to coexist with another install)
-export AWAKE_NS=com.aleksei
+export AWAKE_NS=com.yourname
 
 # Custom hid-nudge location
 export AWAKE_HID=/path/to/my-nudge.sh
